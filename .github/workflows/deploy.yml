@@ -11,7 +11,7 @@ on:
 #            - 'v*'
 
 env:
-  DEPLOY_PATH: /opt/poblaria
+  DEPLOY_PATH: ~/apps/poblaria
 
 jobs:
   deploy:

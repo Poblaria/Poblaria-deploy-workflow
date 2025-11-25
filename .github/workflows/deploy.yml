@@ -1,0 +1,195 @@
+---
+name: Poblaria Deployment
+run-name: "[Deploy] ${{ github.event.head_commit.message || github.ref_name }}"
+
+on:
+  push:
+# TODO: re-enable once stable
+#        branches:
+#            - main
+#        tags:
+#            - 'v*'
+
+env:
+  DEPLOY_PATH: /opt/poblaria
+
+jobs:
+  pre-deploy-validation:
+    name: Pre-deployment validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate docker-compose.yml
+        run: |
+          docker compose config --quiet
+          echo "✅ Docker Compose configuration is valid"
+
+      - name: Check required files
+        run: |
+          required_files=(
+            "docker-compose.yml"
+            "apps/backend/Dockerfile"
+            "apps/frontend/Dockerfile"
+            ".env.example"
+          )
+          
+          for file in "${required_files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "❌ Required file missing: $file"
+              exit 1
+            fi
+            echo "✅ Found: $file"
+          done
+
+  deploy:
+    name: Deploy to remote server
+    runs-on: ubuntu-latest
+    needs: pre-deploy-validation
+    environment:
+      name: production # TODO: apparait dans GH ?
+      url: ${{ vars.PRODUCTION_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p ${{ secrets.SSH_PORT || 22 }} ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create deployment directory on remote server
+        run: |
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || 22 }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+            mkdir -p ${{ env.DEPLOY_PATH }}
+            mkdir -p ${{ env.DEPLOY_PATH }}/apps/backend
+            mkdir -p ${{ env.DEPLOY_PATH }}/apps/frontend
+          EOF
+
+      - name: Transfer project files
+        run: |
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || 22 }}" \
+            --exclude 'node_modules' \
+            --exclude '.git' \
+            --exclude '.env' \
+            --exclude 'apps/backend/build' \
+            --exclude 'apps/frontend/.next' \
+            docker-compose.yml \
+            package.json \
+            package-lock.json \
+            .dockerignore \
+            apps/ \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ env.DEPLOY_PATH }}/
+
+      - name: Create .env file on remote server
+        run: |
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || 22 }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+            cd ${{ env.DEPLOY_PATH }}
+          
+            cat > .env << 'ENVFILE'
+              TZ=UTC
+              PORT=8080
+              HOST=0.0.0.0
+              LOG_LEVEL=info
+              APP_KEY=${{ secrets.APP_KEY }}
+              NODE_ENV=production
+              DB_HOST=db
+              DB_PORT=5432
+              DB_USER=${{ secrets.DB_USER }}
+              DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+              DB_DATABASE=${{ secrets.DB_DATABASE }}
+              DB_MIGRATE=false # TODO: find a way to handle migrations
+              FRONTEND_PORT=3000
+            ENVFILE
+          
+            echo "✅ Environment file created"
+          EOF
+
+      - name: Pull and deploy with Docker Compose
+        run: |
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || 22 }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+            cd ${{ env.DEPLOY_PATH }}
+          
+            echo "🔄 Stopping old containers..."
+            docker compose down || true
+          
+            echo "🔨 Building and starting containers..."
+            docker compose up -d --build --remove-orphans
+          
+            echo "⏳ Waiting for services to be healthy..."
+            sleep 10
+          
+            echo "📊 Container status:"
+            docker compose ps
+          
+            echo "🧹 Cleaning up old images..."
+            docker image prune -f
+          
+            echo "✅ Deployment completed successfully"
+          EOF
+
+      # TODO: optional + remove comment + REMOVE COMMENTS IN OTHER FILES + different env variable handling
+      - name: Health check
+        run: |
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || 22 }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+            cd ${{ env.DEPLOY_PATH }}
+          
+            if ! docker compose ps | grep -q "Up"; then
+              echo "❌ Some containers are not running"
+              docker compose logs --tail=50
+              exit 1
+            fi
+          
+            echo "✅ All containers are running"
+          
+            # Vérifier la santé de l'API (optionnel)
+            max_attempts=30
+            attempt=0
+            while [ $attempt -lt $max_attempts ]; do
+              if docker compose exec -T api wget --spider -q http://127.0.0.1:8080 2>/dev/null; then
+                echo "✅ API is healthy"
+                break
+              fi
+              attempt=$((attempt + 1))
+              echo "⏳ Waiting for API to be ready... ($attempt/$max_attempts)"
+              sleep 2
+            done
+          
+            if [ $attempt -eq $max_attempts ]; then
+              echo "⚠️ API health check timeout)"
+            fi
+          EOF
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
+
+  notify-success:
+    name: Notify deployment success
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: success()
+    steps:
+      - name: Deployment successful
+        run: |
+          echo "🎉 Deployment to production completed successfully!"
+          echo "Version: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+
+  notify-failure:
+    name: Notify deployment failure
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: failure()
+    steps:
+      - name: Deployment failed
+        run: |
+          echo "❌ Deployment to production failed!"
+          echo "Version: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+          exit 1
